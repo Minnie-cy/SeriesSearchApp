@@ -118,6 +118,10 @@ def download_data_from_releases():
     
     # 等待一小段时间确保文件系统完全同步
     time.sleep(0.5)
+    st.info("📂 data/models 目录结构：")
+    for root, dirs, files in os.walk("data/models"):
+        st.text(f"{root} -> {dirs} | {files}")
+
 
 download_data_from_releases()
 
