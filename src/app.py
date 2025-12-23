@@ -34,7 +34,8 @@ def download_data_from_releases():
     files = {
         "data/llm_summaries.json": f"{release_base}/llm_summaries.json",
         "data/database/final.db": f"{release_base}/final.db",
-        "data/qdrant_data.zip": f"{release_base}/qdrant_data.zip"
+        "data/qdrant_data.zip": f"{release_base}/qdrant_data.zip",
+        "data/models/bge-model.zip": f"{release_base}/bge-model.zip"
     }
     
     download_failed = False
@@ -126,7 +127,7 @@ LLM_API_KEY = st.secrets.get("LLM_API_KEY", "sk-f193fd69ee8c47359a35325de4bf2a49
 LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 LLM_MODEL_NAME = st.secrets.get("LLM_MODEL_NAME", "qwen-max")
 QDRANT_PATH = st.secrets.get("QDRANT_PATH", "data/qdrant_data")
-EMBEDDING_MODEL_PATH = st.secrets.get("EMBEDDING_MODEL_PATH", "BAAI/bge-large-zh-v1.5")
+EMBEDDING_MODEL_PATH = st.secrets.get("EMBEDDING_MODEL_PATH", "data/models/bge-model")
 DB_PATH = st.secrets.get("DB_PATH", "data/database/final.db")
 
 # ==============================================================================
