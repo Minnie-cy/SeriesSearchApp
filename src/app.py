@@ -289,7 +289,7 @@ class SmartTVRetriever:
             raise FileNotFoundError(f"Qdrant 数据不完整: {QDRANT_PATH}/meta.json 不存在\n请确保 qdrant_data.zip 已正确解压。")
         
         try:
-            print(f"正在加载本地 Embedding 模型: {EMBEDDING_MODEL_PATH} ...")
+            st.write(f"正在加载本地 Embedding 模型: {EMBEDDING_MODEL_PATH} ...")
             self.embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL_PATH, trust_remote_code=True)
             Settings.embed_model = self.embed_model
         except Exception as e:
@@ -297,7 +297,7 @@ class SmartTVRetriever:
             raise
 
         try:
-            print(f"正在连接 Qdrant 向量数据库: {QDRANT_PATH} ...")
+            st.write(f"正在连接 Qdrant 向量数据库: {QDRANT_PATH} ...")
             self.client = QdrantClient(path=QDRANT_PATH)
             self.rich_index = self._load_index("tv_series_rich_text")
             self.basic_index = self._load_index("tv_series_basic")
@@ -306,7 +306,7 @@ class SmartTVRetriever:
             raise
         
         try:
-            print(f"正在连接 SQL 数据库: {DB_PATH} ...")
+            st.write(f"正在连接 SQL 数据库: {DB_PATH} ...")
             # 验证数据库文件可读
             if not os.access(DB_PATH, os.R_OK):
                 raise PermissionError(f"数据库文件不可读: {DB_PATH}")
@@ -398,7 +398,7 @@ class SmartTVRetriever:
                 results.append(res_dict)
             return results
         except sqlite3.Error as e:
-            print(f"SQL Error: {e}")
+            st.write(f"SQL Error: {e}")
             return []
 
     def _llm_rerank(self, query: str, candidates: List[Dict], top_k: int) -> List[Dict]:
@@ -459,7 +459,7 @@ class SmartTVRetriever:
             return candidates[:top_k]
 
         except Exception as e:
-            print(f"Rerank Error: {e}")
+            st.write(f"Rerank Error: {e}")
             return candidates[:top_k]
 
     def semantic_search(self, user_query: str, top_k: int = 5) -> Dict:
@@ -517,7 +517,7 @@ class SmartTVRetriever:
             if parsed.get("occupation") and len(parsed["occupation"]) > 0:
                 parsed["intent"] = "PERSONA"
             
-            print(f"优化后的意图识别: {parsed}")
+            st.write(f"优化后的意图识别: {parsed}")
             return parsed
         except Exception as e:
             return {"intent": "THEME", "keywords": [query], "occupation": []}
@@ -620,7 +620,38 @@ class SmartTVRetriever:
 # ==============================================================================
 # 3. Streamlit 前端（修改版：支持多选）
 # ==============================================================================
-st.set_page_config(page_title="智能电视剧搜索引擎", page_icon="📺", layout="wide")
+# ================== 🟢 Cloud 友好：数据初始化控制 ==================
+
+st.set_page_config(
+    page_title="智能电视剧搜索引擎",
+    page_icon="📺",
+    layout="wide"
+)
+
+st.title("📺 智能电视剧搜索引擎")
+
+# 初始化状态
+if "data_ready" not in st.session_state:
+    st.session_state.data_ready = False
+
+# 数据未准备好 → 显示初始化 UI
+if not st.session_state.data_ready:
+    st.info("首次启动需要初始化数据（仅第一次需要）")
+
+    with st.expander("📦 数据初始化状态", expanded=True):
+        st.write("数据来源：GitHub Release")
+        st.write("仓库：", st.secrets.get("GITHUB_REPO", "lyf-Felicia/SeriesSearchApp"))
+        st.write("标签：", st.secrets.get("RELEASE_TAG", "1.0"))
+
+        if st.button("🚀 初始化数据"):
+            with st.spinner("正在下载并校验数据，请稍候..."):
+                download_data_from_releases()
+                st.session_state.data_ready = True
+                st.success("✅ 数据初始化完成")
+                st.rerun()
+
+    # ⚠️ 这里 stop 是 **安全的**
+    st.stop()
 
 st.markdown("""
 <style>
@@ -952,8 +983,15 @@ def load_retriever():
             st.code(traceback.format_exc())
         return None
 
+@st.cache_resource
+def load_retriever():
+    with st.spinner("正在初始化后端系统..."):
+        retriever = SmartTVRetriever()
+        return retriever
+
 retriever = load_retriever()
-if not retriever: st.stop()
+if not retriever:
+    st.stop()
 
 tab1, tab2 = st.tabs(["传统筛选", "智能搜索"])
 
