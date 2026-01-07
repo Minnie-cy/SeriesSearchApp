@@ -374,87 +374,84 @@ class SmartTVRetriever:
     def __init__(self):
         log_debug("进入 __init__ 方法")
         
-        # 1. 检查路径
-        if not os.path.exists(DB_PATH):
-            raise FileNotFoundError(f"Missing DB: {DB_PATH}")
-        log_debug("路径检查通过")
-
+        # 1. 检查数据库路径 (获取绝对路径)
+        abs_db_path = os.path.abspath(DB_PATH)
+        if not os.path.exists(abs_db_path):
+            raise FileNotFoundError(f"Missing DB: {abs_db_path}")
+        
         # 2. 初始化 LLM
         self.llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-        log_debug("LLM 客户端已建立")
 
-        # 3. 加载 Embedding 模型 (高危操作)
-        log_debug(f"准备加载 Embedding 模型: {EMBEDDING_MODEL_PATH}")
-        log_debug("⚠️ 警告：即将进行高内存操作...")
+        # 3. 加载 Embedding 模型
+        log_debug(f"加载 Embedding: {EMBEDDING_MODEL_PATH}")
+        # 获取绝对路径
+        abs_model_path = os.path.abspath(EMBEDDING_MODEL_PATH)
         
-        try:
-            # 这里的 device='cpu' 对于 Streamlit Cloud 很重要
-            self.embed_model = HuggingFaceEmbedding(
-                model_name=EMBEDDING_MODEL_PATH, 
-                trust_remote_code=True,
-                device="cpu",
-                embed_batch_size=1
-            )
-            Settings.embed_model = self.embed_model
-            log_debug("✅ Embedding 模型加载完成 (幸存下来了!)")
-        except Exception as e:
-            log_debug(f"❌ Embedding 模型加载失败: {e}")
-            raise e
+        self.embed_model = HuggingFaceEmbedding(
+            model_name=abs_model_path, 
+            trust_remote_code=True,
+            device="cpu", # 服务器够强的话，如果有GPU可以改成 "cuda"
+            embed_batch_size=10 # 既然内存够大，可以改回 10
+        )
+        Settings.embed_model = self.embed_model
+        log_debug("✅ Embedding 模型加载完成")
 
-        # 4. 连接 Qdrant (高危操作)
-        log_debug(f"准备连接 Qdrant: {QDRANT_PATH}")
-        
-        # 路径自动修正逻辑
-        real_qdrant_path = QDRANT_PATH
-        if not os.path.exists(os.path.join(QDRANT_PATH, "collections")):
-             nested = os.path.join(QDRANT_PATH, "qdrant_data")
+        # 4. 连接 Qdrant (关键修改点)
+        # 获取绝对路径
+        abs_qdrant_path = os.path.abspath(QDRANT_PATH)
+        log_debug(f"准备连接 Qdrant (绝对路径): {abs_qdrant_path}")
+
+        # 检查目录下文件，确认数据存在
+        if os.path.exists(abs_qdrant_path):
+            log_debug(f"目录内容: {os.listdir(abs_qdrant_path)}")
+        else:
+            raise FileNotFoundError(f"Qdrant 路径不存在: {abs_qdrant_path}")
+
+        # 修正嵌套路径逻辑
+        real_path = abs_qdrant_path
+        if not os.path.exists(os.path.join(abs_qdrant_path, "collections")):
+             nested = os.path.join(abs_qdrant_path, "qdrant_data")
              if os.path.exists(os.path.join(nested, "collections")):
-                 real_qdrant_path = nested
-                 log_debug(f"修正 Qdrant 路径为: {real_qdrant_path}")
+                 real_path = nested
+                 log_debug(f"修正为嵌套路径: {real_path}")
 
         try:
-            self.client = QdrantClient(path=real_qdrant_path)
-            log_debug("QdrantClient 实例化成功")
+            # ⚠️ 尝试直接初始化
+            # force_disable_check_same_thread 并不是 qdrant 的参数，去掉它
+            # prefer_grpc=False 强制使用 HTTP/本地模式，有时能避免崩溃
+            self.client = QdrantClient(path=real_path, prefer_grpc=False)
             
-            # 仅仅列出集合，不加载数据
+            log_debug("QdrantClient 实例化成功，开始读取集合...")
+            
             cols = self.client.get_collections().collections
             col_names = [c.name for c in cols]
-            log_debug(f"发现集合: {col_names}")
+            log_debug(f"✅ 成功读取集合: {col_names}")
             
             if not col_names:
-                raise ValueError("没有找到集合")
+                raise ValueError("集合列表为空！数据可能损坏。")
 
             rich_name = next((n for n in col_names if "summary" in n or "rich" in n), col_names[0])
             basic_name = next((n for n in col_names if "episode" in n or "basic" in n), rich_name)
-            
-            log_debug(f"准备加载索引: {rich_name}")
-            
-            # ⬇️ 极简加载：不立即创建 Index 对象，只保存 store
-            # 这一步是为了防止读取大量 metadata 进内存
-            self.rich_store = QdrantVectorStore(client=self.client, collection_name=rich_name)
-            self.basic_store = QdrantVectorStore(client=self.client, collection_name=basic_name)
-            
-            # 延迟初始化 Index，这里只做标记
+
             self.rich_index = VectorStoreIndex.from_vector_store(
-                vector_store=self.rich_store,
+                vector_store=QdrantVectorStore(client=self.client, collection_name=rich_name),
                 embed_model=self.embed_model
             )
-            log_debug("✅ rich_index 挂载完成")
             
             if rich_name != basic_name:
                 self.basic_index = VectorStoreIndex.from_vector_store(
-                    vector_store=self.basic_store,
+                    vector_store=QdrantVectorStore(client=self.client, collection_name=basic_name),
                     embed_model=self.embed_model
                 )
             else:
                 self.basic_index = self.rich_index
-            log_debug("✅ basic_index 挂载完成")
 
         except Exception as e:
-            log_debug(f"❌ Qdrant 连接/加载失败: {e}")
+            log_debug(f"❌ Qdrant 致命错误: {e}")
             raise e
 
-        log_debug("🎉 __init__ 全部完成")
+        log_debug("🎉 系统初始化完成")
+        
 
     def _get_connection(self):
         if not hasattr(self, "_conn") or self._conn is None:
