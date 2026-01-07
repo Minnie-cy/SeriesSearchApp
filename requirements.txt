@@ -1,7 +1,7 @@
 # Web 框架
 streamlit>=1.50.0
 protobuf<4.0.0
-
+psutil
 # LlamaIndex 相关
 llama-index>=0.10.0
 llama-index-llms-ollama>=0.1.0
