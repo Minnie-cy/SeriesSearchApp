@@ -330,80 +330,115 @@ def fetch_poster_url(query_title):
 # ==============================================================================
 # 2. 后端逻辑 SmartTVRetriever（修改版：支持多选）
 # ==============================================================================
-@st.cache_resource
+import traceback # 必须引入这个库
+
+# 暂时注释掉缓存，以便看到实时日志
+# @st.cache_resource 
 def load_retriever():
-    """加载并缓存检索器实例"""
-    return SmartTVRetriever()
+    """加载检索器实例（调试版）"""
+    st.write("🔧 开始初始化检索器...")
+    try:
+        return SmartTVRetriever()
+    except Exception as e:
+        st.error(f"❌ 初始化严重失败: {str(e)}")
+        # 打印完整堆栈信息到界面，帮你定位问题
+        st.code(traceback.format_exc())
+        return None
+
 class SmartTVRetriever:
     def __init__(self):
-        # 1. 验证基础路径
+        st.info("1️⃣ 正在检查文件路径...")
+        
+        # 1. 路径检查
         if not os.path.exists(DB_PATH):
-            raise FileNotFoundError(f"数据库文件不存在: {DB_PATH}")
+            raise FileNotFoundError(f"❌ 数据库未找到: {DB_PATH}")
         if not os.path.exists(QDRANT_PATH):
-            raise FileNotFoundError(f"Qdrant 目录不存在: {QDRANT_PATH}")
-            
-        # 2. 初始化 LLM 客户端 (OpenAI 兼容接口)
-        self.llm_client = OpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_BASE_URL
-        )
+            raise FileNotFoundError(f"❌ Qdrant 目录未找到: {QDRANT_PATH}")
+        
+        # 检查模型文件完整性
+        model_config = os.path.join(EMBEDDING_MODEL_PATH, "config.json")
+        if not os.path.exists(model_config):
+            st.warning(f"⚠️ 本地模型 config.json 未找到: {model_config}")
+            st.warning("尝试使用 HuggingFace 在线模型 'BAAI/bge-large-zh-v1.5' (需联网)")
+            self.model_path_to_use = "BAAI/bge-large-zh-v1.5"
+        else:
+            self.model_path_to_use = EMBEDDING_MODEL_PATH
+            st.success(f"✅ 找到本地模型: {self.model_path_to_use}")
 
-        # 3. 加载 Embedding 模型
+        # 2. 初始化 LLM
+        st.info("2️⃣ 正在连接 LLM...")
         try:
-            st.write(f"📦 加载 Embedding 模型: {EMBEDDING_MODEL_PATH}")
-            self.embed_model = HuggingFaceEmbedding(
-                model_name=EMBEDDING_MODEL_PATH, 
-                trust_remote_code=True,
-                device="cpu" # 如果有 GPU 改为 "cuda"
+            self.llm_client = OpenAI(
+                api_key=LLM_API_KEY,
+                base_url=LLM_BASE_URL
             )
-            # 配置全局 Settings，确保 LlamaIndex 使用正确的模型
+            # 测试一下连接
+            # self.llm_client.models.list() 
+        except Exception as e:
+            st.error(f"❌ LLM 连接配置错误: {e}")
+            raise
+
+        # 3. 加载 Embedding 模型 (最容易崩溃的地方)
+        st.info(f"3️⃣ 正在加载 Embedding 模型 (可能需要较多内存)...")
+        try:
+            # 强制指定 device，防止 CUDA 错误（除非你有 GPU）
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            st.write(f"⚙️ 运行设备: {device}")
+
+            self.embed_model = HuggingFaceEmbedding(
+                model_name=self.model_path_to_use, 
+                trust_remote_code=True,
+                device=device 
+            )
             Settings.embed_model = self.embed_model
             st.success("✅ Embedding 模型加载成功!")
         except Exception as e:
-            st.error(f"❌ Embedding 模型加载失败: {str(e)}")
-            raise
+            st.error("❌ Embedding 模型加载崩溃。可能是内存不足或文件损坏。")
+            raise e
 
-        # 4. 初始化 Qdrant 客户端并加载索引
+        # 4. 连接 Qdrant
+        st.info("4️⃣ 正在连接 Qdrant 向量库...")
         try:
-            st.write(f"🔌 连接 Qdrant 数据库: {QDRANT_PATH}")
             self.client = QdrantClient(path=QDRANT_PATH)
             
-            # 获取所有集合名称，自动匹配
-            collections = self.client.get_collections().collections
-            collection_names = [c.name for c in collections]
-            st.info(f"📂 发现向量集合: {collection_names}")
+            # 获取集合列表
+            cols = self.client.get_collections().collections
+            col_names = [c.name for c in cols]
+            st.write(f"📂 Qdrant 中存在的集合: {col_names}")
+            
+            if not col_names:
+                raise ValueError("Qdrant 数据库是空的，没有任何集合！请检查 qdrant_data.zip 是否正确解压。")
 
-            # 假设有两个集合：一个是摘要(Rich)，一个是分集/基础(Basic)
-            # 如果只有一个集合，则两个索引指向同一个即可
-            # 这里根据常见命名习惯尝试匹配，如果没有匹配到则默认使用第一个
-            
-            rich_name = next((name for name in collection_names if "summary" in name or "rich" in name), None)
-            basic_name = next((name for name in collection_names if "episode" in name or "basic" in name), None)
-            
-            # 如果没找到特定名字，就按顺序分配，或者都用第一个
-            if not rich_name and collection_names: rich_name = collection_names[0]
-            if not basic_name and collection_names: basic_name = collection_names[-1] # 如果只有一个，它也是同一个
+            # 简单的自动匹配逻辑
+            # 优先找包含 'series' 或 'summary' 的作为 rich_index
+            rich_name = next((n for n in col_names if "series" in n or "summary" in n), col_names[0])
+            # 优先找包含 'ep' 或 'chunk' 的作为 basic_index
+            basic_name = next((n for n in col_names if "ep" in n or "chunk" in n), rich_name)
 
-            if not rich_name:
-                raise ValueError("❌ 未在 Qdrant 中找到任何集合，请检查 qdrant_data 是否完整。")
+            st.write(f"🔗 绑定索引: Rich -> {rich_name}, Basic -> {basic_name}")
 
-            st.write(f"🔗 正在加载索引: Rich='{rich_name}', Basic='{basic_name}'")
+            self.rich_index = VectorStoreIndex.from_vector_store(
+                vector_store=QdrantVectorStore(client=self.client, collection_name=rich_name),
+                embed_model=self.embed_model
+            )
             
-            # 加载 Rich Index (通常是剧情摘要)
-            self.rich_index = self._load_index_from_store(rich_name)
-            
-            # 加载 Basic Index (通常是分集剧情)
-            if basic_name and basic_name != rich_name:
-                self.basic_index = self._load_index_from_store(basic_name)
+            if rich_name != basic_name:
+                self.basic_index = VectorStoreIndex.from_vector_store(
+                    vector_store=QdrantVectorStore(client=self.client, collection_name=basic_name),
+                    embed_model=self.embed_model
+                )
             else:
-                self.basic_index = self.rich_index # Fallback
+                self.basic_index = self.rich_index
 
-            st.success("✅ 向量索引加载完成!")
+            st.success("🎉 所有组件加载完成！")
 
         except Exception as e:
-            st.error(f"❌ Qdrant 索引加载失败: {str(e)}")
-            raise
+            st.error(f"❌ Qdrant 连接失败: {str(e)}")
+            raise e
 
+    # ... (保留原有的 _get_connection, filter_search, _llm_rerank, semantic_search 等方法不变) ...
+    # 为了完整性，请确保把之前修复的这些方法也粘贴在下面
     def _get_connection(self):
         if not hasattr(self, "_conn") or self._conn is None:
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -412,14 +447,6 @@ class SmartTVRetriever:
 
     def _get_cursor(self):
         return self._get_connection().cursor()
-
-    def _load_index_from_store(self, collection_name: str):
-        """从 Qdrant 加载现有的索引"""
-        vector_store = QdrantVectorStore(client=self.client, collection_name=collection_name)
-        return VectorStoreIndex.from_vector_store(
-            vector_store=vector_store,
-            embed_model=self.embed_model
-        )
 
     def filter_search(self, years: List[str] = None, genres: List[str] = None, 
                      regions: List[str] = None, limit: int = 10) -> List[Dict]:
@@ -482,33 +509,17 @@ class SmartTVRetriever:
 
     def _llm_rerank(self, query: str, candidates: List[Dict], top_k: int) -> List[Dict]:
         if not candidates: return []
-        
-        # 限制重排数量，节省 Token
         candidates_to_rank = candidates[:10] 
         items_text = ""
         for i, res in enumerate(candidates_to_rank):
-            # 防止描述过长
             desc = res.get('display_text', res.get('description', ''))[:200]
             items_text += f"ID: {i} | 标题: 《{res['title']}》 | 内容: {desc}\n"
 
-        rerank_prompt = f"""你是一个专业的影视推荐官。请根据用户的需求，对候选剧集进行相关性打分。
-
+        rerank_prompt = f"""请根据用户需求对剧集进行相关性打分(0-10分)。
 用户需求："{query}"
-
 候选列表：
 {items_text}
-
-任务要求：
-1. 严格根据用户需求与剧集内容的相关度打分（0-10分）。
-2. 只返回 JSON 格式，包含一个数组，每个对象包含 id 和 score。
-3. 如果剧集完全符合人设（如用户要看"医生"，该剧主角确实是医生），给 9-10 分。
-4. 如果只是背景提到或不相关，给 0-3 分。
-
-输出示例：
-[
-  {{"id": 0, "score": 9.5}},
-  {{"id": 1, "score": 4.0}}
-]"""
+只返回JSON格式数组，包含id和score。示例: [{{"id": 0, "score": 9.5}}]"""
 
         try:
             response = self.llm_client.chat.completions.create(
@@ -520,17 +531,12 @@ class SmartTVRetriever:
                 response_format={ "type": "json_object" },
                 temperature=0.1
             )
-            
             content = response.choices[0].message.content.strip()
-            # 简单的 JSON 提取逻辑
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
-                
             scores_data = json.loads(content)
-            
-            # 兼容不同的 JSON 结构
             scores_list = []
             if isinstance(scores_data, list):
                 scores_list = scores_data
@@ -539,45 +545,26 @@ class SmartTVRetriever:
                     if isinstance(v, list):
                         scores_list = v
                         break
-            
-            # 更新分数
             for item in scores_list:
                 idx = int(item.get('id', -1))
                 score = float(item.get('score', 0))
                 if 0 <= idx < len(candidates_to_rank):
                     candidates_to_rank[idx]['rerank_score'] = score
-            
-            # 重新排序：优先用 rerank_score，没有则用原始 score
             candidates_to_rank.sort(key=lambda x: x.get('rerank_score', x.get('score', 0)), reverse=True)
             return candidates_to_rank[:top_k]
-
         except Exception as e:
-            print(f"Rerank Error: {e}")
             return candidates[:top_k]
 
     def semantic_search(self, user_query: str, top_k: int = 5) -> Dict:
-        """语义搜索主入口"""
-        # 1. 意图识别
         intent_data = self._classify_intent(user_query)
-        
-        # 2. 向量检索
         recall_top_k = 15 
-        
-        # 使用在 __init__ 中已经加载好的 retriever
         retriever_rich = self.rich_index.as_retriever(similarity_top_k=recall_top_k)
         retriever_basic = self.basic_index.as_retriever(similarity_top_k=recall_top_k)
-        
         nodes_rich = retriever_rich.retrieve(user_query)
-        # 如果 basic 和 rich 是同一个索引，就不用查两遍了，但为了逻辑兼容这里保留
         nodes_basic = retriever_basic.retrieve(user_query) if self.basic_index != self.rich_index else []
-
-        # 3. 结果合并
         candidates = self._merge_and_rank_results(nodes_rich, nodes_basic, user_query)
-        
-        # 4. LLM 重排
         st.toast("🚀 正在调用大模型进行精准排序...", icon="🧠")
         final_results = self._llm_rerank(user_query, candidates, top_k)
-
         return {
             "query_analysis": intent_data,
             "results": final_results,
@@ -585,27 +572,9 @@ class SmartTVRetriever:
         }
 
     def _classify_intent(self, query: str) -> Dict:
-        prompt = f"""你是一个影视搜索专家，负责将用户查询解析为搜索参数。
-    
-    【任务】
-    从用户输入中提取以下字段并返回JSON：
-    1. intent: 
-       - "PERSONA": 用户提到了特定职业、身份、人设（如：医生、霸总、单亲妈妈）。
-       - "SCENE": 用户提到了具体情节或名场面（如：跳崖、雨中分手、误会）。
-       - "THEME": 模糊的题材、风格或情绪（如：甜宠、虐心、爽剧）。
-    2. keywords: 核心关键词列表。
-    3. occupation: 提取出的具体职业或身份标签（若无则为空列表）。
-    
-    【示例】
-    输入："想看男主是医生的甜宠剧"
-    返回：{{"intent": "PERSONA", "keywords": ["医生", "甜宠"], "occupation": ["医生"]}}
-    
-    输入："男女主在雨中分手的名场面"
-    返回：{{"intent": "SCENE", "keywords": ["雨中分手", "分手"], "occupation": []}}
-    
-    输入："{query}"
-    """
-    
+        prompt = f"""分析用户影视搜索意图，返回JSON。
+输入："{query}"
+格式：{{"intent": "PERSONA"|"SCENE"|"THEME", "keywords": [], "occupation": []}}"""
         try:
             response = self.llm_client.chat.completions.create(
                 model=LLM_MODEL_NAME,
@@ -619,24 +588,20 @@ class SmartTVRetriever:
 
     def _merge_and_rank_results(self, nodes_rich, nodes_basic, query):
         series_map = {}
-        
         def process(nodes, src, boost=0.0):
             for node in nodes:
                 m = node.metadata
-                # 兼容不同的 metadata 字段名
                 sid = m.get('series_id', m.get('id'))
                 if not sid: continue
-                
                 score = node.score + boost
                 full_text = node.text
-                
                 if sid not in series_map:
                     series_map[sid] = {
                         "series_id": sid,
                         "title": m.get('title', m.get('parent_title', '未知')),
                         "score": score,
                         "source_type": src,
-                        "hit_type": m.get('type', 'summary'), # summary or episode
+                        "hit_type": m.get('type', 'summary'), 
                         "matched_episodes": [],
                         "display_text": full_text,
                         "year": m.get('year', '未知'),
@@ -644,23 +609,17 @@ class SmartTVRetriever:
                         "region": m.get('region', '未知')
                     }
                 else:
-                    # 如果新分数更高，更新分数
                     if score > series_map[sid]["score"]:
                         series_map[sid]["score"] = score
-                    # 保留最长的文本作为展示
                     if len(full_text) > len(series_map[sid]["display_text"]):
                         series_map[sid]["display_text"] = full_text
-                
-                # 如果是分集信息，加入 matched_episodes
                 if m.get('type') == 'episode':
                     series_map[sid]['matched_episodes'].append({
                         "ep_number": m.get('ep_number', '?'),
                         "content_snippet": full_text[:150] + "..."
                     })
-        
-        process(nodes_rich, "Rich", 0.1) # 摘要匹配加权
+        process(nodes_rich, "Rich", 0.1)
         process(nodes_basic, "Basic", 0.0)
-        
         final_list = list(series_map.values())
         final_list.sort(key=lambda x: x['score'], reverse=True)
         return final_list
