@@ -390,7 +390,7 @@ class SmartTVRetriever:
                 raise PermissionError(f"数据库文件不可读: {DB_PATH}")
 
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-
+            self._conn.row_factory = sqlite3.Row
         return self._conn
 
     def _get_cursor(self):
