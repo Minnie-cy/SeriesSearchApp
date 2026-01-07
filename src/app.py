@@ -398,17 +398,13 @@ class SmartTVRetriever:
         cursor.fetchone()
         cursor.close()
     
+    def _get_connection(self):
+        if not hasattr(self, "_conn"):
+            self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
     def _get_cursor(self):
-        """获取数据库游标，确保连接有效"""
-        try:
-            # 测试连接是否有效
-            self.conn.execute("SELECT 1")
-            return self._get_cursor().cursor()
-        except (sqlite3.ProgrammingError, AttributeError):
-            # 连接失效，重新建立
-            st.warning("数据库连接已断开，正在重新连接...")
-            self._init_db_connection()
-            return self._get_cursor().cursor()
+        return self._get_connection().cursor()
 
     def _load_index(self, collection_name: str):
         vector_store = QdrantVectorStore(client=self.client, collection_name=collection_name)
