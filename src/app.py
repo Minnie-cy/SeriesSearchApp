@@ -383,26 +383,16 @@ class SmartTVRetriever:
             st.error(f"模型路径: {EMBEDDING_MODEL_PATH}")
             st.error(f"路径是否存在: {os.path.exists(EMBEDDING_MODEL_PATH)}")
             raise
-
-    def _init_db_connection(self):
-        """初始化数据库连接"""
-        if not os.access(DB_PATH, os.R_OK):
-            raise PermissionError(f"数据库文件不可读: {DB_PATH}")
-        
-        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        
-        # 测试连接
-        cursor = self._get_cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
-        cursor.fetchone()
-        cursor.close()
     
     def _get_connection(self):
-        if not hasattr(self, "_conn"):
+        if not hasattr(self, "_conn") or self._conn is None:
+            if not os.access(DB_PATH, os.R_OK):
+                raise PermissionError(f"数据库文件不可读: {DB_PATH}")
+
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
+
         return self._conn
+
     def _get_cursor(self):
         return self._get_connection().cursor()
 
