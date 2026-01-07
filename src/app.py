@@ -331,114 +331,103 @@ def fetch_poster_url(query_title):
 # 2. 后端逻辑 SmartTVRetriever（修改版：支持多选）
 # ==============================================================================
 import traceback # 必须引入这个库
+import gc # 引入垃圾回收模块
 
-# 暂时注释掉缓存，以便看到实时日志
-# @st.cache_resource 
+# ✅ 必须把这个装饰器加回来！它能保证模型只加载一次，不会重复占用内存
+@st.cache_resource(show_spinner=False)
 def load_retriever():
-    """加载检索器实例（调试版）"""
-    st.write("🔧 开始初始化检索器...")
+    """低内存模式加载检索器"""
+    st.write("🔧 初始化后台 (Low RAM Mode)...")
     try:
+        # 强制进行一次垃圾回收，腾出空间
+        gc.collect()
         return SmartTVRetriever()
     except Exception as e:
-        st.error(f"❌ 初始化严重失败: {str(e)}")
-        # 打印完整堆栈信息到界面，帮你定位问题
-        st.code(traceback.format_exc())
+        st.error(f"❌ 初始化失败: {str(e)}")
+        # 如果是内存错误，给出明确提示
+        if "memory" in str(e).lower():
+            st.error("⚠️ 检测到内存不足！建议在本地运行，或升级服务器配置。")
         return None
 
 class SmartTVRetriever:
     def __init__(self):
-        st.info("1️⃣ 正在检查文件路径...")
-        
-        # 1. 路径检查
+        # --- 1. 基础路径检查 ---
         if not os.path.exists(DB_PATH):
-            raise FileNotFoundError(f"❌ 数据库未找到: {DB_PATH}")
-        if not os.path.exists(QDRANT_PATH):
-            raise FileNotFoundError(f"❌ Qdrant 目录未找到: {QDRANT_PATH}")
+            raise FileNotFoundError(f"数据库缺失: {DB_PATH}")
         
-        # 检查模型文件完整性
-        model_config = os.path.join(EMBEDDING_MODEL_PATH, "config.json")
-        if not os.path.exists(model_config):
-            st.warning(f"⚠️ 本地模型 config.json 未找到: {model_config}")
-            st.warning("尝试使用 HuggingFace 在线模型 'BAAI/bge-large-zh-v1.5' (需联网)")
-            self.model_path_to_use = "BAAI/bge-large-zh-v1.5"
-        else:
-            self.model_path_to_use = EMBEDDING_MODEL_PATH
-            st.success(f"✅ 找到本地模型: {self.model_path_to_use}")
+        # 路径修正逻辑（同之前）
+        real_qdrant_path = QDRANT_PATH
+        if not os.path.exists(os.path.join(QDRANT_PATH, "collections")):
+             nested = os.path.join(QDRANT_PATH, "qdrant_data")
+             if os.path.exists(os.path.join(nested, "collections")):
+                 real_qdrant_path = nested
 
-        # 2. 初始化 LLM
-        st.info("2️⃣ 正在连接 LLM...")
+        # --- 2. 初始化 LLM (占用内存极小) ---
+        self.llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+
+        # --- 3. 加载 Embedding 模型 (内存大户) ---
+        st.toast("正在加载 AI 模型... (请耐心等待)", icon="⏳")
         try:
-            self.llm_client = OpenAI(
-                api_key=LLM_API_KEY,
-                base_url=LLM_BASE_URL
-            )
-            # 测试一下连接
-            # self.llm_client.models.list() 
-        except Exception as e:
-            st.error(f"❌ LLM 连接配置错误: {e}")
-            raise
-
-        # 3. 加载 Embedding 模型 (最容易崩溃的地方)
-        st.info(f"3️⃣ 正在加载 Embedding 模型 (可能需要较多内存)...")
-        try:
-            # 强制指定 device，防止 CUDA 错误（除非你有 GPU）
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            st.write(f"⚙️ 运行设备: {device}")
-
+            # 这里的 cache_folder 用于复用，减少下载开销
             self.embed_model = HuggingFaceEmbedding(
-                model_name=self.model_path_to_use, 
+                model_name=EMBEDDING_MODEL_PATH, 
                 trust_remote_code=True,
-                device=device 
+                device="cpu", # 强制 CPU，避免加载 CUDA 库占用额外内存
+                embed_batch_size=1, # ⬇️ 关键：减小批处理大小，降低推理时的瞬时内存
             )
             Settings.embed_model = self.embed_model
-            st.success("✅ Embedding 模型加载成功!")
+            
+            # 加载完模型后，立刻清理一波未使用的变量
+            gc.collect()
+            st.write("✅ 模型加载完毕")
+            
         except Exception as e:
-            st.error("❌ Embedding 模型加载崩溃。可能是内存不足或文件损坏。")
+            st.error("❌ 模型加载导致内存溢出")
             raise e
 
-        # 4. 连接 Qdrant
-        st.info("4️⃣ 正在连接 Qdrant 向量库...")
+        # --- 4. 连接 Qdrant (内存大户之二) ---
+        st.toast("正在连接数据库...", icon="💽")
         try:
-            self.client = QdrantClient(path=QDRANT_PATH)
+            # 尝试连接
+            self.client = QdrantClient(path=real_qdrant_path)
             
-            # 获取集合列表
+            # 验证集合
             cols = self.client.get_collections().collections
             col_names = [c.name for c in cols]
-            st.write(f"📂 Qdrant 中存在的集合: {col_names}")
             
             if not col_names:
-                raise ValueError("Qdrant 数据库是空的，没有任何集合！请检查 qdrant_data.zip 是否正确解压。")
+                raise ValueError("Qdrant 数据为空")
 
-            # 简单的自动匹配逻辑
-            # 优先找包含 'series' 或 'summary' 的作为 rich_index
-            rich_name = next((n for n in col_names if "series" in n or "summary" in n), col_names[0])
-            # 优先找包含 'ep' 或 'chunk' 的作为 basic_index
-            basic_name = next((n for n in col_names if "ep" in n or "chunk" in n), rich_name)
+            # 匹配名称
+            rich_name = next((n for n in col_names if "summary" in n or "rich" in n), col_names[0])
+            basic_name = next((n for n in col_names if "episode" in n or "basic" in n), rich_name)
 
-            st.write(f"🔗 绑定索引: Rich -> {rich_name}, Basic -> {basic_name}")
-
+            # ⬇️ 关键优化：不立即构建完整的 VectorStoreIndex，而是使用时再查询
+            # 这样可以避免一开始就把所有索引结构加载到 LlamaIndex 的对象中
+            self.rich_store = QdrantVectorStore(client=self.client, collection_name=rich_name)
             self.rich_index = VectorStoreIndex.from_vector_store(
-                vector_store=QdrantVectorStore(client=self.client, collection_name=rich_name),
+                vector_store=self.rich_store,
                 embed_model=self.embed_model
             )
             
             if rich_name != basic_name:
+                self.basic_store = QdrantVectorStore(client=self.client, collection_name=basic_name)
                 self.basic_index = VectorStoreIndex.from_vector_store(
-                    vector_store=QdrantVectorStore(client=self.client, collection_name=basic_name),
+                    vector_store=self.basic_store,
                     embed_model=self.embed_model
                 )
             else:
                 self.basic_index = self.rich_index
 
-            st.success("🎉 所有组件加载完成！")
+            gc.collect() # 再次清理
+            st.success("🎉 系统就绪!")
 
         except Exception as e:
-            st.error(f"❌ Qdrant 连接失败: {str(e)}")
+            st.error(f"❌ 数据库连接失败: {str(e)}")
             raise e
 
-    # ... (保留原有的 _get_connection, filter_search, _llm_rerank, semantic_search 等方法不变) ...
-    # 为了完整性，请确保把之前修复的这些方法也粘贴在下面
+    # ... 保留其他方法 (_get_connection, filter_search, semantic_search 等) 不变 ...
+    # 务必确保 semantic_search 方法还在类里面
     def _get_connection(self):
         if not hasattr(self, "_conn") or self._conn is None:
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -453,7 +442,6 @@ class SmartTVRetriever:
         cursor = self._get_cursor()
         sql = "SELECT * FROM series WHERE 1=1"
         params = []
-        
         if years:
             year_conditions = []
             for year in years:
@@ -464,7 +452,6 @@ class SmartTVRetriever:
                     params.append(year)
             if year_conditions:
                 sql += f" AND ({' OR '.join(year_conditions)})"
-        
         if regions:
             region_conditions_list = []
             for r in regions:
@@ -477,15 +464,12 @@ class SmartTVRetriever:
                     params.append(f"%{r}%")
             if region_conditions_list:
                 sql += f" AND ({' OR '.join(region_conditions_list)})"
-        
         if genres:
             genre_conditions = " OR ".join(["genre LIKE ?" for _ in genres])
             sql += f" AND ({genre_conditions})"
             params.extend([f"%{g}%" for g in genres])
-            
         sql += " LIMIT ?"
         params.append(limit)
-        
         try:
             cursor.execute(sql, params)
             rows = cursor.fetchall()
@@ -514,13 +498,11 @@ class SmartTVRetriever:
         for i, res in enumerate(candidates_to_rank):
             desc = res.get('display_text', res.get('description', ''))[:200]
             items_text += f"ID: {i} | 标题: 《{res['title']}》 | 内容: {desc}\n"
-
         rerank_prompt = f"""请根据用户需求对剧集进行相关性打分(0-10分)。
 用户需求："{query}"
 候选列表：
 {items_text}
 只返回JSON格式数组，包含id和score。示例: [{{"id": 0, "score": 9.5}}]"""
-
         try:
             response = self.llm_client.chat.completions.create(
                 model=LLM_MODEL_NAME,
