@@ -330,6 +330,11 @@ def fetch_poster_url(query_title):
 # ==============================================================================
 # 2. 后端逻辑 SmartTVRetriever（修改版：支持多选）
 # ==============================================================================
+@st.cache_resource
+def load_retriever():
+    """加载并缓存检索器实例"""
+    return SmartTVRetriever()
+
 class SmartTVRetriever:
     def __init__(self):
         # 验证文件路径
@@ -379,6 +384,32 @@ class SmartTVRetriever:
             st.error(f"路径是否存在: {os.path.exists(EMBEDDING_MODEL_PATH)}")
             raise
 
+    def _init_db_connection(self):
+        """初始化数据库连接"""
+        if not os.access(DB_PATH, os.R_OK):
+            raise PermissionError(f"数据库文件不可读: {DB_PATH}")
+        
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        
+        # 测试连接
+        cursor = self._get_cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
+        cursor.fetchone()
+        cursor.close()
+    
+    def _get_cursor(self):
+        """获取数据库游标，确保连接有效"""
+        try:
+            # 测试连接是否有效
+            self.conn.execute("SELECT 1")
+            return self._get_cursor().cursor()
+        except (sqlite3.ProgrammingError, AttributeError):
+            # 连接失效，重新建立
+            st.warning("数据库连接已断开，正在重新连接...")
+            self._init_db_connection()
+            return self._get_cursor().cursor()
+
     def _load_index(self, collection_name: str):
         vector_store = QdrantVectorStore(client=self.client, collection_name=collection_name)
         return VectorStoreIndex.from_vector_store(vector_store=vector_store)
@@ -386,7 +417,7 @@ class SmartTVRetriever:
     def filter_search(self, years: List[str] = None, genres: List[str] = None, 
                      regions: List[str] = None, limit: int = 10) -> List[Dict]:
         """修改为支持多选的筛选函数"""
-        cursor = self.conn.cursor()
+        cursor = self._get_cursor()
         sql = "SELECT * FROM series WHERE 1=1"
         params = []
         
