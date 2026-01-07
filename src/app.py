@@ -331,103 +331,131 @@ def fetch_poster_url(query_title):
 # 2. 后端逻辑 SmartTVRetriever（修改版：支持多选）
 # ==============================================================================
 import traceback # 必须引入这个库
-import gc # 引入垃圾回收模块
+import sys
+import psutil
+import gc
 
-# ✅ 必须把这个装饰器加回来！它能保证模型只加载一次，不会重复占用内存
+# 辅助函数：打印带时间戳和内存状态的日志
+def log_debug(msg):
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    ram_usage = mem_info.rss / 1024 / 1024  # MB
+    # 获取系统剩余内存
+    vm = psutil.virtual_memory()
+    available = vm.available / 1024 / 1024 # MB
+    
+    log_msg = f"[DEBUG] RAM占用: {ram_usage:.1f}MB | 系统剩余: {available:.1f}MB | {msg}"
+    print(log_msg)  # 打印到后台控制台
+    sys.stdout.flush() # 强制刷新缓冲区
+    
+    # 同时尝试打印到前端（如果还没崩溃的话）
+    try:
+        st.text(log_msg)
+    except:
+        pass
+
 @st.cache_resource(show_spinner=False)
 def load_retriever():
-    """低内存模式加载检索器"""
-    st.write("🔧 初始化后台 (Low RAM Mode)...")
+    log_debug("🚀 开始初始化 load_retriever...")
+    
     try:
-        # 强制进行一次垃圾回收，腾出空间
+        # 强制垃圾回收
         gc.collect()
-        return SmartTVRetriever()
+        retriever = SmartTVRetriever()
+        log_debug("✅ SmartTVRetriever 初始化成功！")
+        return retriever
     except Exception as e:
-        st.error(f"❌ 初始化失败: {str(e)}")
-        # 如果是内存错误，给出明确提示
-        if "memory" in str(e).lower():
-            st.error("⚠️ 检测到内存不足！建议在本地运行，或升级服务器配置。")
+        log_debug(f"❌ 初始化过程中捕获到异常: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 class SmartTVRetriever:
     def __init__(self):
-        # --- 1. 基础路径检查 ---
-        if not os.path.exists(DB_PATH):
-            raise FileNotFoundError(f"数据库缺失: {DB_PATH}")
+        log_debug("进入 __init__ 方法")
         
-        # 路径修正逻辑（同之前）
+        # 1. 检查路径
+        if not os.path.exists(DB_PATH):
+            raise FileNotFoundError(f"Missing DB: {DB_PATH}")
+        log_debug("路径检查通过")
+
+        # 2. 初始化 LLM
+        self.llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+        log_debug("LLM 客户端已建立")
+
+        # 3. 加载 Embedding 模型 (高危操作)
+        log_debug(f"准备加载 Embedding 模型: {EMBEDDING_MODEL_PATH}")
+        log_debug("⚠️ 警告：即将进行高内存操作...")
+        
+        try:
+            # 这里的 device='cpu' 对于 Streamlit Cloud 很重要
+            self.embed_model = HuggingFaceEmbedding(
+                model_name=EMBEDDING_MODEL_PATH, 
+                trust_remote_code=True,
+                device="cpu",
+                embed_batch_size=1
+            )
+            Settings.embed_model = self.embed_model
+            log_debug("✅ Embedding 模型加载完成 (幸存下来了!)")
+        except Exception as e:
+            log_debug(f"❌ Embedding 模型加载失败: {e}")
+            raise e
+
+        # 4. 连接 Qdrant (高危操作)
+        log_debug(f"准备连接 Qdrant: {QDRANT_PATH}")
+        
+        # 路径自动修正逻辑
         real_qdrant_path = QDRANT_PATH
         if not os.path.exists(os.path.join(QDRANT_PATH, "collections")):
              nested = os.path.join(QDRANT_PATH, "qdrant_data")
              if os.path.exists(os.path.join(nested, "collections")):
                  real_qdrant_path = nested
+                 log_debug(f"修正 Qdrant 路径为: {real_qdrant_path}")
 
-        # --- 2. 初始化 LLM (占用内存极小) ---
-        self.llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-
-        # --- 3. 加载 Embedding 模型 (内存大户) ---
-        st.toast("正在加载 AI 模型... (请耐心等待)", icon="⏳")
         try:
-            # 这里的 cache_folder 用于复用，减少下载开销
-            self.embed_model = HuggingFaceEmbedding(
-                model_name=EMBEDDING_MODEL_PATH, 
-                trust_remote_code=True,
-                device="cpu", # 强制 CPU，避免加载 CUDA 库占用额外内存
-                embed_batch_size=1, # ⬇️ 关键：减小批处理大小，降低推理时的瞬时内存
-            )
-            Settings.embed_model = self.embed_model
-            
-            # 加载完模型后，立刻清理一波未使用的变量
-            gc.collect()
-            st.write("✅ 模型加载完毕")
-            
-        except Exception as e:
-            st.error("❌ 模型加载导致内存溢出")
-            raise e
-
-        # --- 4. 连接 Qdrant (内存大户之二) ---
-        st.toast("正在连接数据库...", icon="💽")
-        try:
-            # 尝试连接
             self.client = QdrantClient(path=real_qdrant_path)
+            log_debug("QdrantClient 实例化成功")
             
-            # 验证集合
+            # 仅仅列出集合，不加载数据
             cols = self.client.get_collections().collections
             col_names = [c.name for c in cols]
+            log_debug(f"发现集合: {col_names}")
             
             if not col_names:
-                raise ValueError("Qdrant 数据为空")
+                raise ValueError("没有找到集合")
 
-            # 匹配名称
             rich_name = next((n for n in col_names if "summary" in n or "rich" in n), col_names[0])
             basic_name = next((n for n in col_names if "episode" in n or "basic" in n), rich_name)
-
-            # ⬇️ 关键优化：不立即构建完整的 VectorStoreIndex，而是使用时再查询
-            # 这样可以避免一开始就把所有索引结构加载到 LlamaIndex 的对象中
+            
+            log_debug(f"准备加载索引: {rich_name}")
+            
+            # ⬇️ 极简加载：不立即创建 Index 对象，只保存 store
+            # 这一步是为了防止读取大量 metadata 进内存
             self.rich_store = QdrantVectorStore(client=self.client, collection_name=rich_name)
+            self.basic_store = QdrantVectorStore(client=self.client, collection_name=basic_name)
+            
+            # 延迟初始化 Index，这里只做标记
             self.rich_index = VectorStoreIndex.from_vector_store(
                 vector_store=self.rich_store,
                 embed_model=self.embed_model
             )
+            log_debug("✅ rich_index 挂载完成")
             
             if rich_name != basic_name:
-                self.basic_store = QdrantVectorStore(client=self.client, collection_name=basic_name)
                 self.basic_index = VectorStoreIndex.from_vector_store(
                     vector_store=self.basic_store,
                     embed_model=self.embed_model
                 )
             else:
                 self.basic_index = self.rich_index
-
-            gc.collect() # 再次清理
-            st.success("🎉 系统就绪!")
+            log_debug("✅ basic_index 挂载完成")
 
         except Exception as e:
-            st.error(f"❌ 数据库连接失败: {str(e)}")
+            log_debug(f"❌ Qdrant 连接/加载失败: {e}")
             raise e
 
-    # ... 保留其他方法 (_get_connection, filter_search, semantic_search 等) 不变 ...
-    # 务必确保 semantic_search 方法还在类里面
+        log_debug("🎉 __init__ 全部完成")
+
     def _get_connection(self):
         if not hasattr(self, "_conn") or self._conn is None:
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -540,11 +568,19 @@ class SmartTVRetriever:
     def semantic_search(self, user_query: str, top_k: int = 5) -> Dict:
         intent_data = self._classify_intent(user_query)
         recall_top_k = 15 
+        
+        # 增加搜索时的调试信息
+        log_debug(f"正在搜索: {user_query}")
+        
         retriever_rich = self.rich_index.as_retriever(similarity_top_k=recall_top_k)
         retriever_basic = self.basic_index.as_retriever(similarity_top_k=recall_top_k)
+        
         nodes_rich = retriever_rich.retrieve(user_query)
         nodes_basic = retriever_basic.retrieve(user_query) if self.basic_index != self.rich_index else []
+        
         candidates = self._merge_and_rank_results(nodes_rich, nodes_basic, user_query)
+        log_debug(f"召回数量: {len(candidates)}")
+        
         st.toast("🚀 正在调用大模型进行精准排序...", icon="🧠")
         final_results = self._llm_rerank(user_query, candidates, top_k)
         return {
