@@ -395,12 +395,12 @@ class SmartTVRetriever:
             log_debug(f"❌ 模型加载失败: {e}")
             raise e
 
-        # 4. 【核心修改】不读磁盘Qdrant，直接在内存中重建
+        # 4. 从数据库重建内存索引
         log_debug("🔥 正在从数据库重建内存索引 (这可能需要几分钟)...")
         st.info("检测到数据文件异常，正在利用高性能内存重建索引...")
         
         try:
-            # 初始化一个纯内存的 Qdrant，不依赖磁盘文件
+            # 初始化一个纯内存的 Qdrant
             self.client = QdrantClient(":memory:")
             
             # 从数据库读取数据
@@ -413,8 +413,7 @@ class SmartTVRetriever:
             # 构建存储后端
             vector_store = QdrantVectorStore(client=self.client, collection_name="memory_series")
             
-            # 生成索引 (这一步会调用 Embedding 模型)
-            # 你的服务器性能很强，这里应该很快
+            # 生成索引
             self.index = VectorStoreIndex.from_documents(
                 docs,
                 storage_context=StorageContext.from_defaults(vector_store=vector_store),
@@ -422,7 +421,6 @@ class SmartTVRetriever:
                 show_progress=True 
             )
             
-            # 为了简化逻辑，Rich 和 Basic 指向同一个内存索引
             self.rich_index = self.index
             self.basic_index = self.index
             
@@ -439,37 +437,33 @@ class SmartTVRetriever:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        # 读取剧集基础信息
-        cursor.execute("SELECT id, title, summary, genre, region, year, cast FROM series")
+        # ⬇️ 修复点：给 "cast" 加上双引号，避免与 SQL 关键字冲突
+        cursor.execute('SELECT id, title, summary, genre, region, year, "cast" FROM series')
         rows = cursor.fetchall()
         conn.close()
         
         documents = []
         for row in rows:
-            # 组合文本：标题 + 简介 + 演员
-            # 清理 None 值
             title = row['title'] or "未知"
             summary = row['summary'] or "暂无简介"
+            # 这里的 row['cast'] 对应数据库列名，不需要加引号
             cast = row['cast'] or ""
             
             text_content = f"标题：{title}\n主演：{cast}\n简介：{summary}"
             
-            # 构建元数据
             metadata = {
                 "series_id": row['id'],
                 "title": title,
                 "year": str(row['year']) if row['year'] else "未知",
                 "genre": row['genre'] or "未知",
                 "region": row['region'] or "未知",
-                "type": "summary" # 标记为摘要类型
+                "type": "summary"
             }
             
             doc = Document(text=text_content, metadata=metadata)
             documents.append(doc)
             
         return documents
-
-    # --- 以下方法保持不变 (保留你之前的逻辑) ---
 
     def _get_connection(self):
         if not hasattr(self, "_conn") or self._conn is None:
@@ -583,19 +577,11 @@ class SmartTVRetriever:
     def semantic_search(self, user_query: str, top_k: int = 5) -> Dict:
         intent_data = self._classify_intent(user_query)
         recall_top_k = 15 
-        
-        # 增加搜索时的调试信息
         log_debug(f"正在搜索: {user_query}")
-        
-        # 这里统一使用重建的 index
         retriever = self.index.as_retriever(similarity_top_k=recall_top_k)
-        
         nodes = retriever.retrieve(user_query)
-        
-        # 兼容旧逻辑，传递两次 nodes (basic 和 rich 是一样的)
         candidates = self._merge_and_rank_results(nodes, nodes, user_query)
         log_debug(f"召回数量: {len(candidates)}")
-        
         st.toast("🚀 正在调用大模型进行精准排序...", icon="🧠")
         final_results = self._llm_rerank(user_query, candidates, top_k)
         return {
@@ -621,12 +607,10 @@ class SmartTVRetriever:
 
     def _merge_and_rank_results(self, nodes_rich, nodes_basic, query):
         series_map = {}
-        # 简化版合并逻辑，去重
         for node in nodes_rich + nodes_basic:
             m = node.metadata
             sid = m.get('series_id')
             if not sid: continue
-            
             if sid not in series_map:
                 series_map[sid] = {
                     "series_id": sid,
@@ -643,7 +627,6 @@ class SmartTVRetriever:
             else:
                  if node.score > series_map[sid]["score"]:
                      series_map[sid]["score"] = node.score
-
         final_list = list(series_map.values())
         final_list.sort(key=lambda x: x['score'], reverse=True)
         return final_list
