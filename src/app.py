@@ -331,7 +331,6 @@ def fetch_poster_url(query_title):
 # 2. 后端逻辑 SmartTVRetriever（修改版：支持多选）
 # ==============================================================================
 class SmartTVRetriever:
-class SmartTVRetriever:
     def __init__(self):
         # 验证文件路径
         st.write("🔍 验证文件路径...")
