@@ -337,6 +337,9 @@ def load_retriever():
 
 class SmartTVRetriever:
     def __init__(self):
+
+        self.rich_index = None
+
         # 验证文件路径
         st.write("🔍 验证文件路径...")
         
@@ -528,11 +531,22 @@ class SmartTVRetriever:
         except Exception as e:
             st.write(f"Rerank Error: {e}")
             return candidates[:top_k]
+    def _init_rich_index(self):
+        if self.rich_index is None:
+            from llama_index.core import VectorStoreIndex
+            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+            embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-large-zh")
+
+            self.rich_index = VectorStoreIndex.from_documents(
+                self.documents,
+                embed_model=embed_model
+            )
 
     def semantic_search(self, user_query: str, top_k: int = 5) -> Dict:
         intent_data = self._classify_intent(user_query)
         recall_top_k = 15 
-        
+        self._init_rich_index()
         retriever_rich = self.rich_index.as_retriever(similarity_top_k=recall_top_k)
         retriever_basic = self.basic_index.as_retriever(similarity_top_k=recall_top_k)
         
