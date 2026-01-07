@@ -155,8 +155,14 @@ def download_data_from_releases():
     
     st.success("✅ 所有数据文件验证通过!")
     
-    # 可选：显示模型目录结构用于调试
-    if st.checkbox("显示详细目录结构（调试用）", value=False):
+    # 移除 checkbox，改为直接注释掉或使用环境变量控制
+    # 如果需要调试，可以设置环境变量 DEBUG=true
+    # if st.checkbox("显示详细目录结构（调试用）", value=False):  # ❌ 删除这行
+    
+    # 可选：仅在调试模式下显示
+    debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+    if debug_mode:
+        st.info("🔍 调试模式：显示详细目录结构")
         st.text("data/models/bge-model/ 目录内容:")
         model_path = "data/models/bge-model"
         if os.path.exists(model_path):
