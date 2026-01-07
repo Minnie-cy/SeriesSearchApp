@@ -22,14 +22,13 @@ def download_data_from_releases():
     # 从 secrets 读取配置，如果没有则使用默认值
     repo = st.secrets.get("GITHUB_REPO", "lyf-Felicia/SeriesSearchApp")
     tag = st.secrets.get("RELEASE_TAG", "1.0")
-    # 使用正确的 GitHub Release URL 格式
     release_base = f"https://github.com/{repo}/releases/download/{tag}"
     
-    # 显示调试信息
     st.info(f"📦 从 GitHub Release 下载数据\n- 仓库: {repo}\n- 标签: {tag}\n- 基础URL: {release_base}")
     
     os.makedirs("data/database", exist_ok=True)
     os.makedirs("data/qdrant_data", exist_ok=True)
+    os.makedirs("data/models", exist_ok=True)  # 确保 models 目录存在
     
     files = {
         "data/llm_summaries.json": f"{release_base}/llm_summaries.json",
@@ -41,87 +40,133 @@ def download_data_from_releases():
     download_failed = False
     
     for local_path, url in files.items():
-        # 优化判断逻辑：如果文件已存在且大小 > 1KB，跳过下载
-        # 对于 zip 文件，检查解压后的目录是否存在
+        # 根据文件类型检查是否需要下载
+        should_skip = False
+        
         if local_path.endswith('.zip'):
-            if os.path.exists("data/qdrant_data") and os.path.exists("data/qdrant_data/meta.json"):
+            if "qdrant_data.zip" in local_path:
+                # 检查 qdrant 数据是否已存在
+                if os.path.exists("data/qdrant_data/meta.json"):
+                    st.success(f"✓ Qdrant 数据已存在，跳过下载")
+                    should_skip = True
+            elif "bge-model.zip" in local_path:
+                # 检查模型是否已存在（查找关键模型文件）
+                model_files = ["config.json", "pytorch_model.bin", "model.safetensors"]
+                if any(os.path.exists(f"data/models/bge-model/{f}") for f in model_files):
+                    st.success(f"✓ BGE 模型已存在，跳过下载")
+                    should_skip = True
+        else:
+            # 非 zip 文件，检查文件是否存在且大小合理
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
                 st.success(f"✓ {os.path.basename(local_path)} 已存在，跳过下载")
-                continue
-        elif os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
-            st.success(f"✓ {os.path.basename(local_path)} 已存在，跳过下载")
+                should_skip = True
+        
+        if should_skip:
             continue
             
         try:
-            with st.spinner(f"正在下载 {os.path.basename(local_path)}..."):
-                # 显示实际下载 URL（用于调试）
+            with st.spinner(f"正在下载 {os.path.basename(local_path)}... (这可能需要几分钟)"):
                 st.text(f"下载URL: {url}")
                 
-                # 使用自定义 Header 模拟浏览器，防止被 GitHub 拦截
+                # 使用自定义 Header
                 opener = urllib.request.build_opener()
                 opener.addheaders = [('User-agent', 'Mozilla/5.0')]
                 urllib.request.install_opener(opener)
                 
+                # 下载文件
                 urllib.request.urlretrieve(url, local_path)
                 
-                # 校验：如果下载的文件太小（可能是下载到了报错页面），抛出异常
-                if os.path.getsize(local_path) < 100:
+                # 验证下载的文件大小
+                file_size = os.path.getsize(local_path)
+                if file_size < 100:
                     with open(local_path, 'r', encoding='utf-8') as f:
                         content = f.read()
-                    st.error(f"❌ 下载的文件内容异常（可能下载到了错误页面）\nURL: {url}\n内容预览: {content[:200]}")
+                    st.error(f"❌ 下载的文件内容异常\nURL: {url}\n内容: {content[:200]}")
                     download_failed = True
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
+                    os.remove(local_path)
                     continue
+                
+                st.info(f"文件大小: {file_size / 1024 / 1024:.2f} MB")
 
+                # 解压 zip 文件
                 if local_path.endswith('.zip'):
+                    st.info(f"正在解压 {os.path.basename(local_path)}...")
                     with zipfile.ZipFile(local_path, 'r') as zip_ref:
-                        zip_ref.extractall("data/")
+                        if "bge-model.zip" in local_path:
+                            # bge-model.zip 解压到 data/models/
+                            # 解压后应该得到 data/models/bge-model/ 目录
+                            zip_ref.extractall("data/models/")
+                        else:
+                            # 其他 zip 文件解压到 data/
+                            zip_ref.extractall("data/")
+                    
+                    # 删除 zip 文件节省空间
                     os.remove(local_path)
                     st.success(f"✓ {os.path.basename(local_path)} 下载并解压成功")
                 else:
                     st.success(f"✓ {os.path.basename(local_path)} 下载成功")
+                    
         except urllib.error.HTTPError as e:
-            st.error(f"❌ 下载失败 {os.path.basename(local_path)}: HTTP {e.code} {e.reason}\nURL: {url}\n\n请检查：\n1. Release 标签是否正确（当前: {tag}）\n2. 文件名是否正确\n3. Release 是否已发布")
+            st.error(f"❌ HTTP 错误 {e.code}: {e.reason}\nURL: {url}\n\n请检查:\n1. Release 标签 '{tag}' 是否正确\n2. 文件是否存在于 Release 中\n3. Release 是否公开")
+            download_failed = True
+        except zipfile.BadZipFile as e:
+            st.error(f"❌ ZIP 文件损坏: {local_path}\n错误: {str(e)}")
             download_failed = True
         except Exception as e:
-            st.error(f"❌ 下载失败 {os.path.basename(local_path)}: {str(e)}\nURL: {url}")
+            st.error(f"❌ 下载失败: {os.path.basename(local_path)}\n错误: {str(e)}\nURL: {url}")
             download_failed = True
     
-    # 如果下载失败，停止应用执行
     if download_failed:
-        st.error("⚠️ 数据文件下载失败，应用无法继续运行。请检查 GitHub Release 配置。")
+        st.error("⚠️ 数据文件下载失败，应用无法继续运行。")
         st.stop()
     
-    # 验证所有必需的文件是否存在且可读
-    required_files = {
-        "数据库文件": "data/database/final.db",
-        "LLM摘要文件": "data/llm_summaries.json",
-        "Qdrant数据目录": "data/qdrant_data"
+    # 验证所有必需的文件/目录
+    st.info("🔍 验证数据完整性...")
+    required_checks = {
+        "数据库文件": ("data/database/final.db", "file"),
+        "LLM摘要文件": ("data/llm_summaries.json", "file"),
+        "Qdrant meta.json": ("data/qdrant_data/meta.json", "file"),
+        "BGE 模型配置": ("data/models/bge-model/config.json", "file"),
     }
     
-    missing_files = []
-    for name, path in required_files.items():
-        if os.path.isdir(path):
-            # 对于目录，检查是否有内容
-            if not os.listdir(path):
-                missing_files.append(f"{name} ({path}) - 目录为空")
-            elif path == "data/qdrant_data" and not os.path.exists(os.path.join(path, "meta.json")):
-                missing_files.append(f"{name} ({path}) - 缺少 meta.json 文件")
-        elif not os.path.exists(path):
-            missing_files.append(f"{name} ({path}) - 文件不存在")
-        elif os.path.getsize(path) < 100:
-            missing_files.append(f"{name} ({path}) - 文件大小异常（可能损坏）")
+    missing_items = []
+    for name, (path, check_type) in required_checks.items():
+        if not os.path.exists(path):
+            missing_items.append(f"{name} ({path})")
+        elif check_type == "file" and os.path.getsize(path) < 10:
+            missing_items.append(f"{name} ({path}) - 文件异常")
     
-    if missing_files:
-        st.error("⚠️ 数据文件验证失败：\n" + "\n".join(f"- {f}" for f in missing_files))
+    if missing_items:
+        st.error("⚠️ 数据验证失败:\n" + "\n".join(f"- {item}" for item in missing_items))
+        
+        # 显示实际的目录结构帮助调试
+        st.warning("📂 实际目录结构:")
+        for root, dirs, files in os.walk("data"):
+            level = root.replace("data", "").count(os.sep)
+            indent = " " * 2 * level
+            st.text(f"{indent}{os.path.basename(root)}/")
+            subindent = " " * 2 * (level + 1)
+            for file in files[:5]:
+                st.text(f"{subindent}{file}")
+            if len(files) > 5:
+                st.text(f"{subindent}... 还有 {len(files)-5} 个文件")
+        
         st.stop()
     
-    # 等待一小段时间确保文件系统完全同步
-    time.sleep(0.5)
-    st.info("📂 data/models 目录结构：")
-    for root, dirs, files in os.walk("data/models"):
-        st.text(f"{root} -> {dirs} | {files}")
-
+    st.success("✅ 所有数据文件验证通过!")
+    
+    # 可选：显示模型目录结构用于调试
+    if st.checkbox("显示详细目录结构（调试用）", value=False):
+        st.text("data/models/bge-model/ 目录内容:")
+        model_path = "data/models/bge-model"
+        if os.path.exists(model_path):
+            for item in os.listdir(model_path)[:20]:
+                item_path = os.path.join(model_path, item)
+                if os.path.isfile(item_path):
+                    size = os.path.getsize(item_path) / 1024 / 1024
+                    st.text(f"  - {item} ({size:.2f} MB)")
+                else:
+                    st.text(f"  - {item}/ (目录)")
 
 download_data_from_releases()
 
@@ -131,9 +176,8 @@ LLM_API_KEY = st.secrets.get("LLM_API_KEY", "sk-f193fd69ee8c47359a35325de4bf2a49
 LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 LLM_MODEL_NAME = st.secrets.get("LLM_MODEL_NAME", "qwen-max")
 QDRANT_PATH = st.secrets.get("QDRANT_PATH", "data/qdrant_data")
-EMBEDDING_MODEL_PATH = st.secrets.get("EMBEDDING_MODEL_PATH", "data/models/bge-model")
+EMBEDDING_MODEL_PATH = st.secrets.get("EMBEDDING_MODEL_PATH", "data/models/bge-model")  # 指向解压后的目录
 DB_PATH = st.secrets.get("DB_PATH", "data/database/final.db")
-
 # ==============================================================================
 # 1. 辅助函数：清理文本中的HTML标签
 # ==============================================================================
