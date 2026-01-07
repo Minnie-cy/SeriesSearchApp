@@ -354,104 +354,122 @@ def log_debug(msg):
     except:
         pass
 
+from llama_index.core import Document, VectorStoreIndex
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+
+# 保持 load_retriever 不变，或者用这个简化版
 @st.cache_resource(show_spinner=False)
 def load_retriever():
-    log_debug("🚀 开始初始化 load_retriever...")
-    
+    st.write("🚀 正在启动高性能内存模式 (In-Memory Mode)...")
     try:
         # 强制垃圾回收
         gc.collect()
-        retriever = SmartTVRetriever()
-        log_debug("✅ SmartTVRetriever 初始化成功！")
-        return retriever
+        return SmartTVRetriever()
     except Exception as e:
-        log_debug(f"❌ 初始化过程中捕获到异常: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        st.error(f"❌ 启动失败: {str(e)}")
         return None
 
 class SmartTVRetriever:
     def __init__(self):
-        log_debug("进入 __init__ 方法")
+        log_debug("进入 __init__ (重建模式)")
         
-        # 1. 检查数据库路径 (获取绝对路径)
-        abs_db_path = os.path.abspath(DB_PATH)
-        if not os.path.exists(abs_db_path):
-            raise FileNotFoundError(f"Missing DB: {abs_db_path}")
-        
+        # 1. 检查数据库是否存在
+        if not os.path.exists(DB_PATH):
+            raise FileNotFoundError(f"数据库未找到: {DB_PATH}")
+
         # 2. 初始化 LLM
         self.llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
         # 3. 加载 Embedding 模型
-        log_debug(f"加载 Embedding: {EMBEDDING_MODEL_PATH}")
-        # 获取绝对路径
-        abs_model_path = os.path.abspath(EMBEDDING_MODEL_PATH)
-        
-        self.embed_model = HuggingFaceEmbedding(
-            model_name=abs_model_path, 
-            trust_remote_code=True,
-            device="cpu", # 服务器够强的话，如果有GPU可以改成 "cuda"
-            embed_batch_size=10 # 既然内存够大，可以改回 10
-        )
-        Settings.embed_model = self.embed_model
-        log_debug("✅ Embedding 模型加载完成")
-
-        # 4. 连接 Qdrant (关键修改点)
-        # 获取绝对路径
-        abs_qdrant_path = os.path.abspath(QDRANT_PATH)
-        log_debug(f"准备连接 Qdrant (绝对路径): {abs_qdrant_path}")
-
-        # 检查目录下文件，确认数据存在
-        if os.path.exists(abs_qdrant_path):
-            log_debug(f"目录内容: {os.listdir(abs_qdrant_path)}")
-        else:
-            raise FileNotFoundError(f"Qdrant 路径不存在: {abs_qdrant_path}")
-
-        # 修正嵌套路径逻辑
-        real_path = abs_qdrant_path
-        if not os.path.exists(os.path.join(abs_qdrant_path, "collections")):
-             nested = os.path.join(abs_qdrant_path, "qdrant_data")
-             if os.path.exists(os.path.join(nested, "collections")):
-                 real_path = nested
-                 log_debug(f"修正为嵌套路径: {real_path}")
-
+        log_debug(f"加载 Embedding 模型: {EMBEDDING_MODEL_PATH}")
         try:
-            # ⚠️ 尝试直接初始化
-            # force_disable_check_same_thread 并不是 qdrant 的参数，去掉它
-            # prefer_grpc=False 强制使用 HTTP/本地模式，有时能避免崩溃
-            self.client = QdrantClient(path=real_path, prefer_grpc=False)
-            
-            log_debug("QdrantClient 实例化成功，开始读取集合...")
-            
-            cols = self.client.get_collections().collections
-            col_names = [c.name for c in cols]
-            log_debug(f"✅ 成功读取集合: {col_names}")
-            
-            if not col_names:
-                raise ValueError("集合列表为空！数据可能损坏。")
-
-            rich_name = next((n for n in col_names if "summary" in n or "rich" in n), col_names[0])
-            basic_name = next((n for n in col_names if "episode" in n or "basic" in n), rich_name)
-
-            self.rich_index = VectorStoreIndex.from_vector_store(
-                vector_store=QdrantVectorStore(client=self.client, collection_name=rich_name),
-                embed_model=self.embed_model
+            self.embed_model = HuggingFaceEmbedding(
+                model_name=os.path.abspath(EMBEDDING_MODEL_PATH), 
+                trust_remote_code=True,
+                device="cpu",
+                embed_batch_size=10
             )
-            
-            if rich_name != basic_name:
-                self.basic_index = VectorStoreIndex.from_vector_store(
-                    vector_store=QdrantVectorStore(client=self.client, collection_name=basic_name),
-                    embed_model=self.embed_model
-                )
-            else:
-                self.basic_index = self.rich_index
-
+            Settings.embed_model = self.embed_model
+            log_debug("✅ Embedding 模型加载完成")
         except Exception as e:
-            log_debug(f"❌ Qdrant 致命错误: {e}")
+            log_debug(f"❌ 模型加载失败: {e}")
             raise e
 
-        log_debug("🎉 系统初始化完成")
+        # 4. 【核心修改】不读磁盘Qdrant，直接在内存中重建
+        log_debug("🔥 正在从数据库重建内存索引 (这可能需要几分钟)...")
+        st.info("检测到数据文件异常，正在利用高性能内存重建索引...")
         
+        try:
+            # 初始化一个纯内存的 Qdrant，不依赖磁盘文件
+            self.client = QdrantClient(":memory:")
+            
+            # 从数据库读取数据
+            docs = self._load_data_from_db()
+            log_debug(f"从数据库加载了 {len(docs)} 条数据")
+            
+            if len(docs) == 0:
+                raise ValueError("数据库中没有数据，无法构建索引")
+
+            # 构建存储后端
+            vector_store = QdrantVectorStore(client=self.client, collection_name="memory_series")
+            
+            # 生成索引 (这一步会调用 Embedding 模型)
+            # 你的服务器性能很强，这里应该很快
+            self.index = VectorStoreIndex.from_documents(
+                docs,
+                storage_context=StorageContext.from_defaults(vector_store=vector_store),
+                embed_model=self.embed_model,
+                show_progress=True 
+            )
+            
+            # 为了简化逻辑，Rich 和 Basic 指向同一个内存索引
+            self.rich_index = self.index
+            self.basic_index = self.index
+            
+            log_debug("✅ 内存索引构建完成！")
+            st.success("🎉 索引重建完成，系统已就绪！")
+
+        except Exception as e:
+            log_debug(f"❌ 索引构建失败: {e}")
+            raise e
+
+    def _load_data_from_db(self) -> List[Document]:
+        """从 SQLite 读取所有剧集数据并转换为 Document 对象"""
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # 读取剧集基础信息
+        cursor.execute("SELECT id, title, summary, genre, region, year, cast FROM series")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        documents = []
+        for row in rows:
+            # 组合文本：标题 + 简介 + 演员
+            # 清理 None 值
+            title = row['title'] or "未知"
+            summary = row['summary'] or "暂无简介"
+            cast = row['cast'] or ""
+            
+            text_content = f"标题：{title}\n主演：{cast}\n简介：{summary}"
+            
+            # 构建元数据
+            metadata = {
+                "series_id": row['id'],
+                "title": title,
+                "year": str(row['year']) if row['year'] else "未知",
+                "genre": row['genre'] or "未知",
+                "region": row['region'] or "未知",
+                "type": "summary" # 标记为摘要类型
+            }
+            
+            doc = Document(text=text_content, metadata=metadata)
+            documents.append(doc)
+            
+        return documents
+
+    # --- 以下方法保持不变 (保留你之前的逻辑) ---
 
     def _get_connection(self):
         if not hasattr(self, "_conn") or self._conn is None:
@@ -569,13 +587,13 @@ class SmartTVRetriever:
         # 增加搜索时的调试信息
         log_debug(f"正在搜索: {user_query}")
         
-        retriever_rich = self.rich_index.as_retriever(similarity_top_k=recall_top_k)
-        retriever_basic = self.basic_index.as_retriever(similarity_top_k=recall_top_k)
+        # 这里统一使用重建的 index
+        retriever = self.index.as_retriever(similarity_top_k=recall_top_k)
         
-        nodes_rich = retriever_rich.retrieve(user_query)
-        nodes_basic = retriever_basic.retrieve(user_query) if self.basic_index != self.rich_index else []
+        nodes = retriever.retrieve(user_query)
         
-        candidates = self._merge_and_rank_results(nodes_rich, nodes_basic, user_query)
+        # 兼容旧逻辑，传递两次 nodes (basic 和 rich 是一样的)
+        candidates = self._merge_and_rank_results(nodes, nodes, user_query)
         log_debug(f"召回数量: {len(candidates)}")
         
         st.toast("🚀 正在调用大模型进行精准排序...", icon="🧠")
@@ -603,38 +621,29 @@ class SmartTVRetriever:
 
     def _merge_and_rank_results(self, nodes_rich, nodes_basic, query):
         series_map = {}
-        def process(nodes, src, boost=0.0):
-            for node in nodes:
-                m = node.metadata
-                sid = m.get('series_id', m.get('id'))
-                if not sid: continue
-                score = node.score + boost
-                full_text = node.text
-                if sid not in series_map:
-                    series_map[sid] = {
-                        "series_id": sid,
-                        "title": m.get('title', m.get('parent_title', '未知')),
-                        "score": score,
-                        "source_type": src,
-                        "hit_type": m.get('type', 'summary'), 
-                        "matched_episodes": [],
-                        "display_text": full_text,
-                        "year": m.get('year', '未知'),
-                        "genre": m.get('genre', '未知'),
-                        "region": m.get('region', '未知')
-                    }
-                else:
-                    if score > series_map[sid]["score"]:
-                        series_map[sid]["score"] = score
-                    if len(full_text) > len(series_map[sid]["display_text"]):
-                        series_map[sid]["display_text"] = full_text
-                if m.get('type') == 'episode':
-                    series_map[sid]['matched_episodes'].append({
-                        "ep_number": m.get('ep_number', '?'),
-                        "content_snippet": full_text[:150] + "..."
-                    })
-        process(nodes_rich, "Rich", 0.1)
-        process(nodes_basic, "Basic", 0.0)
+        # 简化版合并逻辑，去重
+        for node in nodes_rich + nodes_basic:
+            m = node.metadata
+            sid = m.get('series_id')
+            if not sid: continue
+            
+            if sid not in series_map:
+                series_map[sid] = {
+                    "series_id": sid,
+                    "title": m.get('title', '未知'),
+                    "score": node.score,
+                    "source_type": "Memory",
+                    "hit_type": m.get('type', 'summary'), 
+                    "matched_episodes": [],
+                    "display_text": node.text,
+                    "year": m.get('year', '未知'),
+                    "genre": m.get('genre', '未知'),
+                    "region": m.get('region', '未知')
+                }
+            else:
+                 if node.score > series_map[sid]["score"]:
+                     series_map[sid]["score"] = node.score
+
         final_list = list(series_map.values())
         final_list.sort(key=lambda x: x['score'], reverse=True)
         return final_list
